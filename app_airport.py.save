@@ -1,0 +1,369 @@
+import io
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+
+st.set_page_config(page_title="Havalimanı Tahmin Dashboard", layout="wide")
+st.title("✈️ Havalimanı Yolcu Tahmini (Lag + Linear Regression)")
+st.caption("Excel’deki sütun adları neyse, dashboard’da aynen seçenek olarak sunulur.")
+
+
+# -----------------------
+# Sidebar
+# -----------------------
+st.sidebar.header("📁 Dosya & Ayarlar")
+
+use_upload = st.sidebar.toggle("Excel dosyası yükle", value=True)
+
+uploaded_file = None
+file_path = None
+if use_upload:
+    uploaded_file = st.sidebar.file_uploader("Excel yükle (.xlsx)", type=["xlsx"])
+else:
+    file_path = st.sidebar.text_input("Excel dosya yolu", value="havalimanı tahmin veri ln.xlsx")
+
+seq_len = st.sidebar.slider("Lag uzunluğu (seq_len)", 1, 36, 12, 1)
+train_ratio = st.sidebar.slider("Train oranı", 0.6, 0.95, 0.8, 0.05)
+
+do_iqr = st.sidebar.toggle("IQR ile aykırı değer temizle", value=True)
+iqr_k = st.sidebar.slider("IQR çarpanı (k)", 0.5, 5.0, 1.5, 0.1)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Log dönüşümü (opsiyonel)")
+log_mode = st.sidebar.selectbox(
+    "Dönüşüm türü",
+    ["Yok / log değil", "ln(x)", "ln(x+1)"],
+    index=1
+)
+show_backtransformed = st.sidebar.toggle("Grafikleri orijinal ölçekte göster (exp)", value=False)
+
+st.sidebar.markdown("---")
+run_btn = st.sidebar.button("🚀 Modeli Çalıştır")
+
+
+# -----------------------
+# Helpers
+# -----------------------
+@st.cache_data(show_spinner=False)
+def list_sheets_from_upload(file_bytes: bytes):
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    return xls.sheet_names
+
+@st.cache_data(show_spinner=False)
+def list_sheets_from_path(path: str):
+    xls = pd.ExcelFile(path)
+    return xls.sheet_names
+
+def read_sheet(uploaded_file, file_path, sheet_name):
+    if uploaded_file is not None:
+        return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+    return pd.read_excel(file_path, sheet_name=sheet_name)
+
+def safe_to_datetime(s: pd.Series):
+    """Date sütununu olabildiğince güvenli parse et."""
+    # Excel'de Jan-07 gibi formatlar varsa pandas çoğunlukla okur.
+    # Olmazsa, stringe çevirip tekrar dene.
+    out = pd.to_datetime(s, errors="coerce")
+    if out.isna().mean() > 0.5:
+        out = pd.to_datetime(s.astype(str), errors="coerce")
+    return out
+
+def clean_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.replace(" ", "", regex=False)
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def iqr_filter(df, col, k=1.5):
+    q1 = df[col].quantile(0.25)
+    q3 = df[col].quantile(0.75)
+    iqr = q3 - q1
+    lo = q1 - k * iqr
+    hi = q3 + k * iqr
+    return df[(df[col] >= lo) & (df[col] <= hi)]
+
+def add_lags(df, target_col, seq_len):
+    out = df.copy()
+    for lag in range(1, seq_len + 1):
+        out[f"{target_col}_lag{lag}"] = out[target_col].shift(lag)
+    return out
+
+def add_lags_multi(df, cols, seq_len):
+    out = df.copy()
+    for c in cols:
+        for lag in range(1, seq_len + 1):
+            out[f"{c}_lag{lag}"] = out[c].shift(lag)
+    return out
+
+def backtransform(arr):
+    arr = np.asarray(arr, dtype=float)
+    if log_mode == "ln(x)":
+        return np.exp(arr)
+    if log_mode == "ln(x+1)":
+        return np.exp(arr) - 1.0
+    return arr
+
+def linear_regression_forecast(df_model, features, target_col, train_ratio=0.8):
+    df_model = df_model[[target_col] + features].dropna().reset_index(drop=True)
+    X = df_model[features]
+    y = df_model[target_col]
+
+    split = int(len(df_model) * train_ratio)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+
+    y_pred_train = model.predict(X_train)
+    y_pred_test = model.predict(X_test)
+
+    rmse_train = float(np.sqrt(mean_squared_error(y_train, y_pred_train)))
+    rmse_test = float(np.sqrt(mean_squared_error(y_test, y_pred_test)))
+
+    return rmse_train, rmse_test, y_test.index, y_test.values, y_pred_test, model, df_model
+
+
+# -----------------------
+# Sheet selection
+# -----------------------
+sheet_names = None
+if use_upload and uploaded_file is not None:
+    try:
+        sheet_names = list_sheets_from_upload(uploaded_file.getvalue())
+    except Exception as e:
+        st.error(f"Excel okunamadı (upload): {e}")
+elif (not use_upload) and file_path:
+    try:
+        sheet_names = list_sheets_from_path(file_path)
+    except Exception as e:
+        st.error(f"Excel okunamadı (path): {e}")
+
+if sheet_names:
+    default_sheet = "SAWDOM" if "SAWDOM" in sheet_names else sheet_names[0]
+    sheet = st.sidebar.selectbox("Sheet seç (havalimanı)", options=sheet_names, index=sheet_names.index(default_sheet))
+else:
+    sheet = None
+
+
+# -----------------------
+# Main
+# -----------------------
+if run_btn:
+    if (use_upload and uploaded_file is None) or ((not use_upload) and (not file_path)):
+        st.warning("Önce Excel dosyasını seç/yükle.")
+        st.stop()
+    if not sheet:
+        st.warning("Sheet seçilemedi.")
+        st.stop()
+
+    # Read sheet
+    try:
+        df = read_sheet(uploaded_file, file_path, sheet)
+    except Exception as e:
+        st.error(f"Sheet okunamadı: {e}")
+        st.stop()
+
+    st.subheader(f"📄 Sheet: {sheet}")
+    st.write("İlk 5 satır önizleme:")
+    st.dataframe(df.head(), use_container_width=True)
+
+    # Column selection
+    cols = df.columns.tolist()
+    if len(cols) == 0:
+        st.error("Bu sheet'te sütun yok.")
+        st.stop()
+
+    # Date column
+    default_date = "Date" if "Date" in cols else cols[0]
+    date_col = st.selectbox("Tarih sütunu (Date)", options=cols, index=cols.index(default_date))
+
+    # Target column
+    default_target = sheet if sheet in cols else (cols[1] if len(cols) > 1 else cols[0])
+    target_col = st.selectbox("Hedef sütun (tahmin edilecek)", options=cols, index=cols.index(default_target))
+
+    # Extra features (excluding date and target)
+    candidate_extra = [c for c in cols if c not in [date_col, target_col]]
+    extra_features = st.multiselect("Ek özellik sütunları (GT dahil, opsiyonel)", options=candidate_extra, default=[])
+
+    # Clean + sort by date
+    df2 = df.copy()
+    df2[date_col] = safe_to_datetime(df2[date_col])
+
+    # numeric clean for target + extras
+    df2 = clean_numeric(df2, [target_col] + extra_features)
+
+    # drop rows without date
+    df2 = df2.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+
+    # interpolate target
+    df2[target_col] = df2[target_col].interpolate(method="linear")
+
+    # optional IQR filter on target
+    if do_iqr:
+        df2 = iqr_filter(df2, target_col, k=iqr_k)
+
+    # Build lagged dataset
+    df_lag = df2[[date_col, target_col] + extra_features].copy()
+
+    # lag for target + extras (so GT lag'leri de modele girsin)
+    lag_cols = [target_col] + extra_features
+    df_lag = add_lags_multi(df_lag, cols=lag_cols, seq_len=seq_len)
+
+    # Define feature lists
+    lag_only_features = [f"{target_col}_lag{i}" for i in range(1, seq_len + 1)]
+    all_features = lag_only_features + [
+        f"{c}_lag{i}" for c in extra_features for i in range(1, seq_len + 1)
+    ]
+
+    # Drop NA rows due to lags
+    df_lag_model = df_lag.dropna().reset_index(drop=True)
+
+    # Model 1: lag only
+    rmse_tr1, rmse_te1, idx1, y_test1, y_pred1, model1, df_used1 = linear_regression_forecast(
+        df_lag_model[[date_col, target_col] + lag_only_features].copy(),
+        features=lag_only_features,
+        target_col=target_col,
+        train_ratio=train_ratio
+    )
+
+    # Model 2: lag + extra
+    rmse_tr2, rmse_te2, idx2, y_test2, y_pred2, model2, df_used2 = linear_regression_forecast(
+        df_lag_model[[date_col, target_col] + all_features].copy(),
+        features=all_features,
+        target_col=target_col,
+        train_ratio=train_ratio
+    )
+
+    # RMSE summary
+    rmse_table = pd.DataFrame({
+        "Model": ["Lag Only", "Lag + Extra"],
+        "RMSE Train": [rmse_tr1, rmse_tr2],
+        "RMSE Test": [rmse_te1, rmse_te2],
+        "Extra Columns": ["-", ", ".join(extra_features) if extra_features else "-"]
+    })
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("RMSE Test (Lag Only)", f"{rmse_te1:,.4f}")
+    c2.metric("RMSE Test (Lag+Extra)", f"{rmse_te2:,.4f}")
+    if rmse_te1 > 0:
+        c3.metric("İyileşme (%)", f"{(rmse_te1 - rmse_te2)/rmse_te1*100:,.2f}")
+
+    st.subheader("📊 RMSE Tablosu")
+    st.dataframe(rmse_table, use_container_width=True)
+
+    # Build prediction frames with real dates
+    # idx1/idx2 are row indices after dropna/reset; date is stored in df_used
+    dates_used1 = df_used1[date_col].iloc[idx1].values
+    dates_used2 = df_used2[date_col].iloc[idx2].values
+
+    pred_df = pd.DataFrame({
+        "Date": dates_used1,
+        "actual_log": y_test1,
+        "pred_lag_only_log": y_pred1
+    })
+    pred_df2 = pd.DataFrame({
+        "Date": dates_used2,
+        "pred_lag_extra_log": y_pred2
+    })
+    pred_df = pd.merge(pred_df, pred_df2, on="Date", how="outer").sort_values("Date")
+
+    # Backtransform for display if requested
+    if show_backtransformed and log_mode != "Yok / log değil":
+        pred_df["actual"] = backtransform(pred_df["actual_log"])
+        pred_df["pred_lag_only"] = backtransform(pred_df["pred_lag_only_log"])
+        pred_df["pred_lag_extra"] = backtransform(pred_df["pred_lag_extra_log"])
+
+    # Next month forecast (t+1) using model2 (best/extra)
+    # Train model2 on all available rows (df_lag_model)
+    X_all = df_lag_model[all_features]
+    y_all = df_lag_model[target_col]
+    model2.fit(X_all, y_all)
+
+    last_row = df_lag_model.iloc[-1]
+    X_next = last_row[all_features].values.reshape(1, -1)
+    forecast_next_log = float(model2.predict(X_next)[0])
+
+    last_date = pd.to_datetime(df_lag_model[date_col].iloc[-1])
+    next_date = last_date + pd.offsets.MonthBegin(1)
+
+    if show_backtransformed and log_mode != "Yok / log değil":
+        forecast_next = float(backtransform([forecast_next_log])[0])
+        last_actual = float(backtransform([df_lag_model[target_col].iloc[-1]])[0])
+    else:
+        forecast_next = forecast_next_log
+        last_actual = float(df_lag_model[target_col].iloc[-1])
+
+    st.subheader("🔮 Gelecek Ay Tahmini (t+1)")
+    st.write(f"**Son ay:** {last_date.date()}  |  **Tahmin edilen ay:** {next_date.date()}")
+    st.metric("Gelecek ay tahmini", f"{forecast_next:,.4f}" if (not show_backtransformed or log_mode=="Yok / log değil") else f"{forecast_next:,.0f}")
+
+    # Charts
+    st.subheader("📈 Grafikler")
+
+    fig1, ax1 = plt.subplots(figsize=(12, 4.5))
+    if show_backtransformed and log_mode != "Yok / log değil":
+        ax1.plot(pred_df["Date"], pred_df["actual"], label="Gerçek (orijinal)")
+        ax1.plot(pred_df["Date"], pred_df["pred_lag_only"], linestyle="--", linewidth=2, label="Tahmin (Lag Only)")
+        ax1.set_ylabel("Orijinal ölçek")
+    else:
+        ax1.plot(pred_df["Date"], pred_df["actual_log"], label="Gerçek (log)")
+        ax1.plot(pred_df["Date"], pred_df["pred_lag_only_log"], linestyle="--", linewidth=2, label="Tahmin (Lag Only)")
+        ax1.set_ylabel("Log ölçek")
+
+    ax1.set_title("Test Dönemi: Lag Only")
+    ax1.set_xlabel("Tarih")
+    ax1.grid(True)
+    ax1.legend()
+    st.pyplot(fig1)
+
+    fig2, ax2 = plt.subplots(figsize=(12, 4.5))
+    if show_backtransformed and log_mode != "Yok / log değil":
+        ax2.plot(pred_df["Date"], pred_df["actual"], label="Gerçek (orijinal)")
+        ax2.plot(pred_df["Date"], pred_df["pred_lag_extra"], linestyle="--", linewidth=2, label="Tahmin (Lag + Extra)")
+        # forecast uzatma
+        ax2.plot([last_date, next_date], [last_actual, forecast_next], linestyle="--", linewidth=2, label="t+1 forecast")
+        ax2.scatter(next_date, forecast_next, s=80)
+        ax2.set_ylabel("Orijinal ölçek")
+    else:
+        ax2.plot(pred_df["Date"], pred_df["actual_log"], label="Gerçek (log)")
+        ax2.plot(pred_df["Date"], pred_df["pred_lag_extra_log"], linestyle="--", linewidth=2, label="Tahmin (Lag + Extra)")
+        ax2.plot([last_date, next_date], [df_lag_model[target_col].iloc[-1], forecast_next_log], linestyle="--", linewidth=2, label="t+1 forecast")
+        ax2.scatter(next_date, forecast_next_log, s=80)
+        ax2.set_ylabel("Log ölçek")
+
+    ax2.set_title("Test Dönemi: Lag + Extra (GT dahil)")
+    ax2.set_xlabel("Tarih")
+    ax2.grid(True)
+    ax2.legend()
+    st.pyplot(fig2)
+
+    st.subheader("🧾 Test Tahmin Tablosu")
+    st.dataframe(pred_df, use_container_width=True)
+
+    # Download Excel
+    out_xlsx = "airport_dashboard_predictions.xlsx"
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        rmse_table.to_excel(writer, sheet_name="rmse", index=False)
+        pred_df.to_excel(writer, sheet_name="test_predictions", index=False)
+        pd.DataFrame({"Date": [next_date], "forecast_next": [forecast_next], "forecast_next_log": [forecast_next_log]}).to_excel(
+            writer, sheet_name="next_month_forecast", index=False
+        )
+
+    with open(out_xlsx, "rb") as f:
+        st.download_button(
+            "📥 Sonuçları Excel olarak indir",
+            data=f,
+            file_name=out_xlsx,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+else:
+    st.info("Soldan dosya ve sheet seçip aşağıdan sütunları seçtikten sonra **Modeli Çalıştır**’a bas.")
+
