@@ -9,3 +9,14 @@ pandas>=2.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 matplotlib>=3.7.0
+streamlit
+pandas
+matplotlib
+bertopic
+sentence-transformers
+scikit-learn
+transformers
+torch
+pillow
+requests
+openpyxl
