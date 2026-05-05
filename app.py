@@ -296,7 +296,7 @@ if sayfa == "1. Veri Seti Analizi":
     )
 
     min_topic_size = st.slider(
-        "Minimum konu büyüklüğü",
+        "Minimum hizmet sınıfı",
         min_value=2,
         max_value=10,
         value=2
@@ -415,7 +415,7 @@ if sayfa == "1. Veri Seti Analizi":
         existing_cols = [col for col in display_cols if col in df.columns]
         st.dataframe(df[existing_cols])
 
-        st.subheader("MCDM Sonuçları")
+        st.subheader("Karar çıktıları")
         st.dataframe(mcdm_df)
 
         if len(mcdm_df) > 0:
