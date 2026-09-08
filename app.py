@@ -22,11 +22,12 @@ from transformers import pipeline, CLIPProcessor, CLIPModel
 # ==================================================
 
 st.set_page_config(
-    page_title="Havalimanı Yolcu Deneyimi Karar Destek Prototipi",
+    page_title="TerminAI | Havalimanı Yolcu Terminali Hizmetleri",
     layout="wide"
 )
 
-st.title("Havalimanı Yolcu Deneyimi Karar Destek Prototipi")
+st.title("TerminAI")
+st.subheader("Havalimanı Yolcu Terminali Hizmetlerinin İyileştirilmesine Yönelik Çok Modlu Yapay Zekâ Tabanlı Karar Destek Sistemi")
 st.caption(
     "UGC → Önişleme → Konu Modelleme → Duygu Analizi → Görüntü İşleme → "
     "Karar Matrisi / CRITIC → TOPSIS"
