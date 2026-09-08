@@ -37,6 +37,8 @@ sayfa = st.sidebar.radio(
     ["1. Veri Seti Analizi", "2. Manuel Yorum ve Görsel Analizi"]
 )
 
+st.sidebar.caption("Hızlandırılmış sürüm: cache + batch inference")
+
 with st.sidebar.expander("Proje metodolojik akışı", expanded=True):
     st.markdown(
         """
@@ -63,6 +65,16 @@ def load_sentiment_model():
     )
 
 
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_excel_data(excel_url):
+    return pd.read_excel(excel_url)
+
+
 @st.cache_resource
 def load_clip_model():
     """Ön prototip için temas noktası sınıflandırması.
@@ -80,11 +92,14 @@ def load_clip_model():
 # ADIM 1-2: VERİ VE ÖNİŞLEME
 # ==================================================
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_image_from_github(url):
     try:
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
-            return Image.open(BytesIO(r.content)).convert("RGB")
+            image = Image.open(BytesIO(r.content)).convert("RGB")
+            image.thumbnail((512, 512))
+            return image
     except Exception:
         return None
     return None
@@ -108,7 +123,9 @@ def preprocess_topic_text(text):
 # ADIM 3: KONU MODELLEME
 # ==================================================
 
-def run_bertopic(docs, min_topic_size=2):
+@st.cache_resource(show_spinner=False)
+def run_bertopic(docs_tuple, min_topic_size=2):
+    docs = list(docs_tuple)
     # Olumsuzluk belirteçlerini (not/no vb.) stop-word listesine koymuyoruz.
     stopwords = [
         "the", "and", "to", "of", "in", "is", "it", "for", "was", "are", "you",
@@ -128,7 +145,7 @@ def run_bertopic(docs, min_topic_size=2):
         min_df=1
     )
 
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    embedding_model = load_embedding_model()
 
     topic_model = BERTopic(
         embedding_model=embedding_model,
@@ -198,22 +215,26 @@ def manual_service_area_mapping(text):
 # ADIM 4: DUYGU ANALİZİ
 # ==================================================
 
-def get_sentiment_scores(text):
-    """İmzalı duygu ve iyileştirme modeli için olumsuzluk skoru döndürür.
-
-    signed_sentiment: pozitif için +p, negatif için -p
-    negative_score: negatif yorumda p, pozitif yorumda 0
-    """
+@st.cache_data(show_spinner=False)
+def batch_sentiment_scores(texts_tuple, batch_size=16):
+    """Yorumları tek tek değil batch halinde işler."""
     model = load_sentiment_model()
-    result = model(str(text)[:512])[0]
+    texts = [str(t)[:512] for t in texts_tuple]
+    results = model(texts, batch_size=batch_size, truncation=True)
 
-    label = str(result["label"]).upper()
-    score = float(result["score"])
+    signed = []
+    negative = []
+    for result in results:
+        label = str(result["label"]).upper()
+        score = float(result["score"])
+        signed.append(score if label == "POSITIVE" else -score)
+        negative.append(score if label == "NEGATIVE" else 0.0)
+    return signed, negative
 
-    signed_sentiment = score if label == "POSITIVE" else -score
-    negative_score = score if label == "NEGATIVE" else 0.0
 
-    return signed_sentiment, negative_score
+def get_sentiment_scores(text):
+    signed, negative = batch_sentiment_scores((str(text),), batch_size=1)
+    return signed[0], negative[0]
 
 
 # ==================================================
@@ -250,6 +271,44 @@ def classify_image(image):
 
     best = int(probs.argmax())
     return label_names[best], float(probs[best])
+
+
+def classify_images_batch(image_dict, batch_size=16):
+    """Benzersiz görselleri CLIP ile batch halinde sınıflandırır."""
+    if not image_dict:
+        return {}
+
+    model, processor, device = load_clip_model()
+    labels = {
+        "security_area": "a photo of airport security screening area or passport control",
+        "waiting_area": "a photo of airport waiting area with seats and passengers",
+        "boarding_gate": "a photo of an airport boarding gate",
+        "baggage_claim": "a photo of airport baggage claim area",
+        "food_retail_area": "a photo of airport food court restaurant cafe or retail shop",
+        "restroom": "a photo of airport restroom or toilet facilities",
+        "terminal_general": "a photo of airport terminal interior",
+        "unclear": "an unclear or irrelevant airport photo"
+    }
+    label_names = list(labels.keys())
+    prompts = list(labels.values())
+    items = list(image_dict.items())
+    predictions = {}
+
+    for start in range(0, len(items), batch_size):
+        chunk = items[start:start + batch_size]
+        names = [name for name, _ in chunk]
+        images = [img for _, img in chunk]
+        inputs = processor(
+            text=prompts, images=images, return_tensors="pt", padding=True
+        ).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()
+        for name, row_probs in zip(names, probs):
+            best = int(row_probs.argmax())
+            predictions[name] = (label_names[best], float(row_probs[best]))
+
+    return predictions
 
 
 def get_image_files(text):
@@ -511,7 +570,7 @@ if sayfa == "1. Veri Seti Analizi":
         st.subheader("Adım 1 — Veri")
 
         try:
-            df = pd.read_excel(excel_url)
+            df = load_excel_data(excel_url).copy()
             st.success(f"Veri başarıyla yüklendi. Ham kayıt sayısı: {len(df)}")
         except Exception as e:
             st.error(f"Excel yüklenemedi. URL'yi kontrol edin. Hata: {e}")
@@ -560,7 +619,7 @@ if sayfa == "1. Veri Seti Analizi":
         docs = df["topic_text"].tolist()
 
         with st.spinner("Sentence-Transformer + BERTopic çalıştırılıyor..."):
-            topic_model, topics = run_bertopic(docs, min_topic_size)
+            topic_model, topics = run_bertopic(tuple(docs), min_topic_size)
             df["topic"] = topics
 
         topic_info = topic_model.get_topic_info()
@@ -588,9 +647,12 @@ if sayfa == "1. Veri Seti Analizi":
         st.subheader("Adım 4 — Duygu Analizi")
 
         with st.spinner("Duygu analizi yapılıyor..."):
-            sentiment_results = df["content"].apply(get_sentiment_scores)
-            df["sentiment"] = sentiment_results.apply(lambda x: x[0])
-            df["negative_score"] = sentiment_results.apply(lambda x: x[1])
+            signed_scores, negative_scores = batch_sentiment_scores(
+                tuple(df["content"].tolist()),
+                batch_size=16
+            )
+            df["sentiment"] = signed_scores
+            df["negative_score"] = negative_scores
 
         st.caption(
             "Karar modelinde mutlak duygu şiddeti yerine yalnızca olumsuzluk skoru "
@@ -601,14 +663,21 @@ if sayfa == "1. Veri Seti Analizi":
         st.subheader("Adım 5 — Görüntü İşleme ve Çok Modlu Destek")
 
         if use_images:
-            with st.spinner("Görsellerde havalimanı temas noktaları sınıflandırılıyor..."):
+            with st.spinner("Görseller batch olarak sınıflandırılıyor..."):
+                image_predictions = classify_images_batch(image_dict, batch_size=16)
                 all_labels = []
                 all_confidences = []
                 multimodal_supports = []
 
                 for _, row in df.iterrows():
                     files = get_image_files(row.get("image_files", ""))
-                    labels, confidences = analyse_images_for_review(files, image_dict)
+                    labels = []
+                    confidences = []
+                    for file_name in files:
+                        if file_name in image_predictions:
+                            label, conf = image_predictions[file_name]
+                            labels.append(label)
+                            confidences.append(conf)
 
                     all_labels.append(" | ".join(labels))
                     all_confidences.append(
@@ -616,9 +685,7 @@ if sayfa == "1. Veri Seti Analizi":
                     )
                     multimodal_supports.append(
                         service_area_multimodal_support(
-                            row["service_area"],
-                            labels,
-                            confidences
+                            row["service_area"], labels, confidences
                         )
                     )
 
