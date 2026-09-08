@@ -167,10 +167,12 @@ def run_bertopic(docs_tuple):
         random_state=42
     )
 
+    # "leaf" seçimi küçük pilot veri setlerinde daha ince ve homojen
+    # doğal kümelerin keşfedilmesini destekler; konu sayısı önceden zorlanmaz.
     hdbscan_model = HDBSCAN(
         min_cluster_size=min_topic_size,
         metric="euclidean",
-        cluster_selection_method="eom",
+        cluster_selection_method="leaf",
         prediction_data=True
     )
 
