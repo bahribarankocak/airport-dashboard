@@ -26,8 +26,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("TerminAI")
-st.subheader("Havalimanı Yolcu Terminali Hizmetlerinin İyileştirilmesine Yönelik Çok Modlu Yapay Zekâ Tabanlı Karar Destek Sistemi")
+st.title("Termin-AI")
+st.subheader("Havalimanı Yolcu Terminali Hizmetlerinin İyileştirilmesine Yönelik Yapay Zekâ Tabanlı Karar Destek Sistemi")
+st.subheader("Arayüz Prototipi 1.0")
 st.caption(
     "UGC → Önişleme → Konu Modelleme → Duygu Analizi → Görüntü İşleme → "
     "Karar Matrisi / CRITIC → TOPSIS"
