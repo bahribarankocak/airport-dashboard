@@ -1,3 +1,5 @@
+import re
+import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -6,6 +8,7 @@ from io import BytesIO
 from PIL import Image
 import torch
 import ssl
+
 ssl._create_default_https_context = ssl._create_unverified_context
 
 from bertopic import BERTopic
@@ -14,18 +17,43 @@ from sklearn.feature_extraction.text import CountVectorizer
 from transformers import pipeline, CLIPProcessor, CLIPModel
 
 
+# ==================================================
+# SAYFA AYARLARI
+# ==================================================
+
 st.set_page_config(
-    page_title="Havalimanı Deneyimi Karar Destek Demo",
+    page_title="Havalimanı Yolcu Deneyimi Karar Destek Prototipi",
     layout="wide"
 )
 
-st.title("Havalimanı Yolcu Deneyimi Karar Destek Demo")
+st.title("Havalimanı Yolcu Deneyimi Karar Destek Prototipi")
+st.caption(
+    "UGC → Önişleme → Konu Modelleme → Duygu Analizi → Görüntü İşleme → "
+    "Karar Matrisi / CRITIC → TOPSIS"
+)
 
 sayfa = st.sidebar.radio(
     "Ekran Seçiniz",
     ["1. Veri Seti Analizi", "2. Manuel Yorum ve Görsel Analizi"]
 )
 
+with st.sidebar.expander("Proje metodolojik akışı", expanded=True):
+    st.markdown(
+        """
+        1. **Veri**  
+        2. **Önişleme**  
+        3. **Konu modelleme**  
+        4. **Duygu analizi**  
+        5. **Görüntü işleme**  
+        6. **Karar matrisi + CRITIC**  
+        7. **TOPSIS karar modelleme**
+        """
+    )
+
+
+# ==================================================
+# MODEL YÜKLEME
+# ==================================================
 
 @st.cache_resource
 def load_sentiment_model():
@@ -37,27 +65,160 @@ def load_sentiment_model():
 
 @st.cache_resource
 def load_clip_model():
+    """Ön prototip için temas noktası sınıflandırması.
+
+    Nihai projede CNN/ConvMixer/MLP-Mixer/ViT/Swin Transformer karşılaştırması
+    ve özgün model geliştirme aşaması bunun yerini alacaktır.
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     return model, processor, device
 
 
+# ==================================================
+# ADIM 1-2: VERİ VE ÖNİŞLEME
+# ==================================================
+
 def load_image_from_github(url):
     try:
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
             return Image.open(BytesIO(r.content)).convert("RGB")
-    except:
+    except Exception:
         return None
     return None
 
 
-def get_sentiment(text):
+def preprocess_topic_text(text):
+    """BERTopic için temel metin temizliği.
+
+    Ham metin ayrıca korunur. Stop-word filtreleme CountVectorizer aşamasında
+    uygulanır. Nihai araştırma uygulamasında lemmatizasyon ayrıca eklenebilir.
+    """
+    text = str(text).lower()
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[^a-z0-9\s'-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# ==================================================
+# ADIM 3: KONU MODELLEME
+# ==================================================
+
+def run_bertopic(docs, min_topic_size=2):
+    # Olumsuzluk belirteçlerini (not/no vb.) stop-word listesine koymuyoruz.
+    stopwords = [
+        "the", "and", "to", "of", "in", "is", "it", "for", "was", "are", "you",
+        "this", "that", "with", "as", "on", "at", "be", "have", "has", "had",
+        "we", "they", "he", "she", "my", "our", "your", "their",
+        "a", "an", "do", "does", "did", "done",
+        "there", "here", "where", "when", "which", "who", "what",
+        "if", "even", "but", "all", "very", "still", "been",
+        "can", "could", "would", "should",
+        "airport", "istanbul", "iga", "ist", "flight", "flights",
+        "turkish", "verified", "unverified", "trip", "review"
+    ]
+
+    vectorizer_model = CountVectorizer(
+        stop_words=stopwords,
+        ngram_range=(1, 2),
+        min_df=1
+    )
+
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    topic_model = BERTopic(
+        embedding_model=embedding_model,
+        vectorizer_model=vectorizer_model,
+        language="english",
+        calculate_probabilities=False,
+        verbose=False,
+        min_topic_size=min_topic_size
+    )
+
+    topics, _ = topic_model.fit_transform(docs)
+    return topic_model, topics
+
+
+def auto_label_topic(words):
+    """Demo amaçlı konu → hizmet alanı etiketleme.
+
+    Konular BERTopic ile veri tabanlı keşfedilir; bu fonksiyon yalnızca bulunan
+    konulara okunabilir hizmet alanı adı vermek için kullanılır.
+    """
+    joined = " ".join(words).lower()
+
+    if any(k in joined for k in ["security", "passport", "screening", "control"]):
+        return "Güvenlik ve pasaport kontrolü"
+    if any(k in joined for k in ["baggage", "luggage", "bag", "carousel"]):
+        return "Bagaj hizmetleri"
+    if any(k in joined for k in ["seat", "waiting", "gate", "crowd", "boarding"]):
+        return "Bekleme alanı ve biniş kapısı"
+    if any(k in joined for k in ["food", "restaurant", "cafe", "shop", "retail", "price", "expensive"]):
+        return "Yiyecek-içecek ve perakende"
+    if any(k in joined for k in ["toilet", "restroom", "clean", "dirty", "hygiene"]):
+        return "Tuvalet ve temizlik"
+    if any(k in joined for k in ["staff", "employee", "personnel", "rude", "helpful", "service"]):
+        return "Personel hizmetleri"
+    if any(k in joined for k in ["wifi", "internet"]):
+        return "Dijital hizmetler"
+    if any(k in joined for k in ["check-in", "checkin", "check"]):
+        return "Check-in süreçleri"
+
+    return "Diğer"
+
+
+def manual_service_area_mapping(text):
+    text = str(text).lower()
+
+    if any(k in text for k in ["security", "passport", "screening", "control"]):
+        return "Güvenlik ve pasaport kontrolü"
+    if any(k in text for k in ["baggage", "luggage", "bag", "carousel"]):
+        return "Bagaj hizmetleri"
+    if any(k in text for k in ["seat", "waiting", "queue", "gate", "crowded", "boarding"]):
+        return "Bekleme alanı ve biniş kapısı"
+    if any(k in text for k in ["food", "restaurant", "cafe", "shop", "retail", "expensive", "price"]):
+        return "Yiyecek-içecek ve perakende"
+    if any(k in text for k in ["toilet", "restroom", "clean", "dirty", "hygiene"]):
+        return "Tuvalet ve temizlik"
+    if any(k in text for k in ["staff", "rude", "employee", "personnel", "helpful", "service"]):
+        return "Personel hizmetleri"
+    if any(k in text for k in ["wifi", "internet"]):
+        return "Dijital hizmetler"
+    if any(k in text for k in ["check-in", "check in", "checkin"]):
+        return "Check-in süreçleri"
+
+    return "Diğer"
+
+
+# ==================================================
+# ADIM 4: DUYGU ANALİZİ
+# ==================================================
+
+def get_sentiment_scores(text):
+    """İmzalı duygu ve iyileştirme modeli için olumsuzluk skoru döndürür.
+
+    signed_sentiment: pozitif için +p, negatif için -p
+    negative_score: negatif yorumda p, pozitif yorumda 0
+    """
     model = load_sentiment_model()
     result = model(str(text)[:512])[0]
-    return result["score"] if result["label"] == "POSITIVE" else -result["score"]
 
+    label = str(result["label"]).upper()
+    score = float(result["score"])
+
+    signed_sentiment = score if label == "POSITIVE" else -score
+    negative_score = score if label == "NEGATIVE" else 0.0
+
+    return signed_sentiment, negative_score
+
+
+# ==================================================
+# ADIM 5: GÖRÜNTÜ İŞLEME / ÇOK MODLU DESTEK
+# ==================================================
 
 def classify_image(image):
     model, processor, device = load_clip_model()
@@ -87,76 +248,8 @@ def classify_image(image):
         outputs = model(**inputs)
         probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
 
-    best = probs.argmax()
+    best = int(probs.argmax())
     return label_names[best], float(probs[best])
-
-
-def run_bertopic(docs, min_topic_size=2):
-    stopwords = [
-        "the", "and", "to", "of", "in", "is", "it", "for", "was", "are", "you",
-        "this", "that", "with", "as", "on", "at", "be", "have", "has", "had",
-        "we", "they", "he", "she", "my", "our", "your", "their",
-        "a", "an", "do", "does", "did", "done",
-        "there", "here", "where", "when", "which", "who", "what",
-        "if", "even", "but", "all", "very", "still", "been",
-        "not", "no", "don", "dont", "can", "could", "would", "should",
-        "airport", "istanbul", "iga", "ist", "flight", "flights",
-        "turkish", "verified", "unverified", "trip", "review"
-    ]
-
-    vectorizer_model = CountVectorizer(
-        stop_words=stopwords,
-        ngram_range=(1, 2),
-        min_df=1
-    )
-
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    topic_model = BERTopic(
-        embedding_model=embedding_model,
-        vectorizer_model=vectorizer_model,
-        language="english",
-        calculate_probabilities=False,
-        verbose=False,
-        min_topic_size=min_topic_size
-    )
-
-    topics, _ = topic_model.fit_transform(docs)
-    return topic_model, topics
-
-
-def auto_label_topic(words):
-    joined = " ".join(words)
-
-    if any(k in joined for k in ["security", "passport", "check", "control", "departure"]):
-        return "Güvenlik ve check-in süreçleri"
-    elif any(k in joined for k in ["food", "internet", "toilet", "wifi", "expensive", "free"]):
-        return "Yiyecek-içecek, internet ve tuvalet hizmetleri"
-    elif any(k in joined for k in ["staff", "passenger", "service", "rude"]):
-        return "Personel ve yolcu deneyimi"
-    elif any(k in joined for k in ["seat", "waiting", "gate", "crowd"]):
-        return "Bekleme alanı ve terminal konforu"
-    elif any(k in joined for k in ["baggage", "luggage", "bag"]):
-        return "Bagaj hizmetleri"
-    else:
-        return "Diğer"
-
-
-def manual_criterion_mapping(text):
-    text = text.lower()
-
-    if any(k in text for k in ["security", "passport", "check-in", "check in", "control"]):
-        return "Güvenlik ve check-in süreçleri"
-    elif any(k in text for k in ["food", "internet", "wifi", "toilet", "restroom", "expensive"]):
-        return "Yiyecek-içecek, internet ve tuvalet hizmetleri"
-    elif any(k in text for k in ["staff", "rude", "employee", "personnel", "service"]):
-        return "Personel ve yolcu deneyimi"
-    elif any(k in text for k in ["seat", "waiting", "queue", "gate", "crowded"]):
-        return "Bekleme alanı ve terminal konforu"
-    elif any(k in text for k in ["baggage", "luggage", "bag"]):
-        return "Bagaj hizmetleri"
-    else:
-        return "Diğer"
 
 
 def get_image_files(text):
@@ -174,11 +267,9 @@ def build_image_dict_from_github(df, image_base_url):
     for files in df["image_files"].dropna():
         for file in str(files).split("|"):
             file = file.strip()
-
             if file and file not in image_dict:
-                image_url = f"{image_base_url}/{file}"
+                image_url = f"{image_base_url.rstrip('/')}/{file}"
                 image = load_image_from_github(image_url)
-
                 if image is not None:
                     image_dict[file] = image
 
@@ -198,22 +289,29 @@ def analyse_images_for_review(image_files, image_dict):
             label, conf = classify_image(image)
             labels.append(label)
             confidences.append(conf)
-        except:
+        except Exception:
             continue
 
     return labels, confidences
 
 
-def criterion_visual_match(criterion, image_labels, image_confidences):
-    criterion_image_map = {
-        "Güvenlik ve check-in süreçleri": ["security_area", "boarding_gate"],
-        "Yiyecek-içecek, internet ve tuvalet hizmetleri": ["food_retail_area", "restroom"],
-        "Personel ve yolcu deneyimi": ["waiting_area", "terminal_general"],
-        "Bekleme alanı ve terminal konforu": ["waiting_area", "terminal_general", "boarding_gate"],
-        "Bagaj hizmetleri": ["baggage_claim"]
+def service_area_multimodal_support(service_area, image_labels, image_confidences):
+    """Metindeki hizmet alanının görsel temas noktasıyla bağlamsal desteği.
+
+    Bu skor görseldeki sorunun şiddetini ölçmez.
+    """
+    service_area_image_map = {
+        "Güvenlik ve pasaport kontrolü": ["security_area"],
+        "Check-in süreçleri": ["terminal_general"],
+        "Bekleme alanı ve biniş kapısı": ["waiting_area", "boarding_gate", "terminal_general"],
+        "Bagaj hizmetleri": ["baggage_claim"],
+        "Yiyecek-içecek ve perakende": ["food_retail_area"],
+        "Tuvalet ve temizlik": ["restroom"],
+        "Personel hizmetleri": ["terminal_general", "waiting_area", "boarding_gate", "security_area"],
+        "Dijital hizmetler": ["terminal_general", "waiting_area"]
     }
 
-    allowed = criterion_image_map.get(criterion, [])
+    allowed = service_area_image_map.get(service_area, [])
 
     matched_conf = [
         conf for label, conf in zip(image_labels, image_confidences)
@@ -223,67 +321,172 @@ def criterion_visual_match(criterion, image_labels, image_confidences):
     if len(matched_conf) == 0:
         return 0.0
 
-    return sum(matched_conf) / len(matched_conf)
-
-
-def build_mcdm(df):
-    summary = df.groupby("criterion").agg(
-        frequency=("content", "count"),
-        sentiment_mean=("sentiment", "mean"),
-        visual_match_mean=("visual_match", "mean")
-    ).reset_index()
-
-    summary["sentiment_intensity"] = summary["sentiment_mean"].abs()
-    summary["v_j"] = 1 + summary["visual_match_mean"].fillna(0)
-
-    summary["raw_score"] = (
-        summary["frequency"] *
-        summary["sentiment_intensity"] *
-        summary["v_j"]
-    )
-
-    if summary["raw_score"].sum() > 0:
-        summary["weight"] = summary["raw_score"] / summary["raw_score"].sum()
-    else:
-        summary["weight"] = 0
-
-    for col in ["frequency", "sentiment_intensity", "v_j"]:
-        min_val = summary[col].min()
-        max_val = summary[col].max()
-
-        if max_val == min_val:
-            summary[col + "_norm"] = 1
-        else:
-            summary[col + "_norm"] = (summary[col] - min_val) / (max_val - min_val)
-
-    summary["mcdm_score"] = (
-        summary["frequency_norm"] * 0.40 +
-        summary["sentiment_intensity_norm"] * 0.40 +
-        summary["v_j_norm"] * 0.20
-    )
-
-    summary = summary.sort_values("mcdm_score", ascending=False).reset_index(drop=True)
-
-    summary["rank"] = summary["mcdm_score"].rank(
-        ascending=False,
-        method="dense"
-    ).astype(int)
-
-    return summary
+    return float(np.mean(matched_conf))
 
 
 # ==================================================
-# EKRAN 1
+# ADIM 6: KARAR MATRİSİ, NORMALİZASYON, CRITIC
+# ==================================================
+
+def minmax_benefit_normalize(series):
+    series = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    min_val = series.min()
+    max_val = series.max()
+    if np.isclose(max_val, min_val):
+        # Sabit kriter bilgi taşımadığı için CRITIC'te 0'a çekilir.
+        return pd.Series(np.zeros(len(series)), index=series.index)
+    return (series - min_val) / (max_val - min_val)
+
+
+def build_decision_matrix(df):
+    """Hizmet alanları = alternatifler; C1-C3 = karar kriterleri."""
+    work = df[df["service_area"].notna()].copy()
+    work = work[work["service_area"] != "Diğer"].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    total_reviews = len(work)
+
+    summary = work.groupby("service_area").agg(
+        mention_count=("content", "count"),
+        negative_sentiment=("negative_score", "mean"),
+        multimodal_support=("multimodal_support", "mean")
+    ).reset_index()
+
+    summary["prevalence"] = summary["mention_count"] / total_reviews
+
+    return summary[
+        ["service_area", "mention_count", "prevalence", "negative_sentiment", "multimodal_support"]
+    ]
+
+
+def normalize_decision_matrix(decision_df):
+    normalized = decision_df[["service_area"]].copy()
+    normalized["C1_prevalence"] = minmax_benefit_normalize(decision_df["prevalence"])
+    normalized["C2_negative_sentiment"] = minmax_benefit_normalize(decision_df["negative_sentiment"])
+    normalized["C3_multimodal_support"] = minmax_benefit_normalize(decision_df["multimodal_support"])
+    return normalized
+
+
+def calculate_critic_weights(normalized_df):
+    criteria = [
+        "C1_prevalence",
+        "C2_negative_sentiment",
+        "C3_multimodal_support"
+    ]
+
+    X = normalized_df[criteria].astype(float)
+    std = X.std(ddof=0)
+
+    active = std[std > 1e-12].index.tolist()
+    weights = pd.Series(0.0, index=criteria)
+    info = pd.Series(0.0, index=criteria)
+
+    if len(active) == 0:
+        weights[:] = 1.0 / len(criteria)
+    elif len(active) == 1:
+        weights[active[0]] = 1.0
+        info[active[0]] = std[active[0]]
+    else:
+        corr = X[active].corr().fillna(0.0)
+        conflict = pd.Series(index=active, dtype=float)
+
+        for col in active:
+            # Diagonal terim 1-1=0 olduğundan toplamı değiştirmez.
+            conflict[col] = (1.0 - corr.loc[col, active]).sum()
+
+        critic_information = std[active] * conflict
+
+        if critic_information.sum() <= 1e-12:
+            weights[active] = 1.0 / len(active)
+            info[active] = std[active]
+        else:
+            weights[active] = critic_information / critic_information.sum()
+            info[active] = critic_information
+
+    label_map = {
+        "C1_prevalence": "C1 - Yaygınlık",
+        "C2_negative_sentiment": "C2 - Olumsuz duygu",
+        "C3_multimodal_support": "C3 - Çok modlu destek"
+    }
+
+    return pd.DataFrame({
+        "criterion": criteria,
+        "criterion_name": [label_map[c] for c in criteria],
+        "critic_information": [float(info[c]) for c in criteria],
+        "weight": [float(weights[c]) for c in criteria]
+    })
+
+
+# ==================================================
+# ADIM 7: TOPSIS KARAR MODELLEME
+# ==================================================
+
+def calculate_topsis(decision_df, weights_df):
+    """Tüm kriterler iyileştirme önceliği açısından fayda yönlü ele alınır."""
+    if decision_df.empty:
+        return pd.DataFrame()
+
+    criteria_cols = ["prevalence", "negative_sentiment", "multimodal_support"]
+    X = decision_df[criteria_cols].astype(float).to_numpy()
+
+    # Vektör normalizasyonu (TOPSIS)
+    denominators = np.sqrt((X ** 2).sum(axis=0))
+    denominators = np.where(denominators == 0, 1.0, denominators)
+    R = X / denominators
+
+    weight_map = dict(zip(weights_df["criterion"], weights_df["weight"]))
+    w = np.array([
+        weight_map.get("C1_prevalence", 0.0),
+        weight_map.get("C2_negative_sentiment", 0.0),
+        weight_map.get("C3_multimodal_support", 0.0)
+    ], dtype=float)
+
+    if np.isclose(w.sum(), 0):
+        w = np.array([1/3, 1/3, 1/3])
+    else:
+        w = w / w.sum()
+
+    V = R * w
+
+    # Üçü de yüksek olduğunda iyileştirme önceliği artıyor.
+    ideal_best = V.max(axis=0)
+    ideal_worst = V.min(axis=0)
+
+    d_best = np.sqrt(((V - ideal_best) ** 2).sum(axis=1))
+    d_worst = np.sqrt(((V - ideal_worst) ** 2).sum(axis=1))
+
+    denom = d_best + d_worst
+    score = np.divide(
+        d_worst,
+        denom,
+        out=np.zeros_like(d_worst),
+        where=denom != 0
+    )
+
+    result = decision_df.copy()
+    result["topsis_score"] = score
+    result = result.sort_values("topsis_score", ascending=False).reset_index(drop=True)
+    result["rank"] = np.arange(1, len(result) + 1)
+
+    return result
+
+
+# ==================================================
+# EKRAN 1: VERİ SETİ ANALİZİ
 # ==================================================
 
 if sayfa == "1. Veri Seti Analizi":
 
     st.header("1. Veri Seti Analizi")
 
-    st.info("""
-    Bu ekranda GitHub'daki Excel veri seti ve görseller kullanılarak konu modelleme,
-    duygu analizi, görsel sınıflandırma ve MCDM sonuçları üretilir.
-    """)
+    st.info(
+        "Bu ekran proje metodolojisinin ön prototipidir. Görüntü sınıflandırmasında "
+        "şimdilik CLIP kullanılmaktadır; proje kapsamında CNN tabanlı transfer öğrenimi, "
+        "ConvMixer, MLP-Mixer, ViT ve Swin Transformer modelleri karşılaştırılarak "
+        "özgün görüntü sınıflandırma modeli geliştirilecektir."
+    )
 
     excel_url = st.text_input(
         "GitHub Excel Raw URL",
@@ -296,17 +499,20 @@ if sayfa == "1. Veri Seti Analizi":
     )
 
     min_topic_size = st.slider(
-        "Minimum hizmet sınıfı",
+        "Minimum konu büyüklüğü",
         min_value=2,
         max_value=10,
         value=2
     )
 
-    if st.button("Veriyi GitHub'dan Yükle ve Analizi Başlat"):
+    if st.button("Veriyi GitHub'dan Yükle ve Analizi Başlat", type="primary"):
+
+        # ---------- ADIM 1: VERİ ----------
+        st.subheader("Adım 1 — Veri")
 
         try:
             df = pd.read_excel(excel_url)
-            st.success("Excel GitHub'dan başarıyla yüklendi.")
+            st.success(f"Veri başarıyla yüklendi. Ham kayıt sayısı: {len(df)}")
         except Exception as e:
             st.error(f"Excel yüklenemedi. URL'yi kontrol edin. Hata: {e}")
             st.stop()
@@ -315,40 +521,49 @@ if sayfa == "1. Veri Seti Analizi":
             st.error("Excel dosyasında 'content' kolonu olmalıdır.")
             st.stop()
 
+        # ---------- ADIM 2: ÖNİŞLEME ----------
+        st.subheader("Adım 2 — Önişleme")
+
         df = df[df["content"].notna()].copy()
         df["content"] = df["content"].astype(str).str.strip()
+        df = df.drop_duplicates(subset=["content"]).copy()
         df = df[df["content"].str.len() > 20].reset_index(drop=True)
+
+        df["topic_text"] = df["content"].apply(preprocess_topic_text)
+        df = df[df["topic_text"].str.len() > 10].reset_index(drop=True)
 
         if len(df) < 3:
             st.error("Analiz için yeterli yorum yok.")
             st.stop()
 
+        st.write(f"Önişleme sonrası analiz edilebilir yorum sayısı: **{len(df)}**")
+        st.dataframe(df[["content", "topic_text"]].head(10), use_container_width=True)
+
         with st.spinner("GitHub görselleri kontrol ediliyor..."):
             image_dict = build_image_dict_from_github(df, image_base_url)
 
-        use_images = False
+        use_images = "image_files" in df.columns and len(image_dict) > 0
 
-        if "image_files" in df.columns and len(image_dict) > 0:
-            use_images = True
-            st.success(f"Görsel analiz aktif. Yüklenen görsel sayısı: {len(image_dict)}")
+        if use_images:
+            st.success(f"Görsel veri bulundu. Yüklenen görsel sayısı: {len(image_dict)}")
         else:
-            st.warning("Görsel veri bulunamadı. Sistem sadece metin analizi modunda çalışacak.")
-            df["image_files"] = ""
-            df["image_labels"] = ""
-            df["image_confidence_avg"] = 0
-            df["visual_match"] = 0
+            st.warning(
+                "Görsel veri bulunamadı. C3 - Çok modlu destek sabit kalacağından "
+                "CRITIC bu kriteri bilgi taşımayan kriter olarak değerlendirebilir."
+            )
+            if "image_files" not in df.columns:
+                df["image_files"] = ""
 
-        st.subheader("Yüklenen Veri")
-        st.dataframe(df.head())
+        # ---------- ADIM 3: KONU MODELLEME ----------
+        st.subheader("Adım 3 — Konu Modelleme")
 
-        docs = df["content"].tolist()
+        docs = df["topic_text"].tolist()
 
-        with st.spinner("Konu modelleme yapılıyor..."):
+        with st.spinner("Sentence-Transformer + BERTopic çalıştırılıyor..."):
             topic_model, topics = run_bertopic(docs, min_topic_size)
             df["topic"] = topics
 
         topic_info = topic_model.get_topic_info()
-
         topic_label_map = {}
 
         for topic_id in topic_info["Topic"].tolist():
@@ -356,36 +571,52 @@ if sayfa == "1. Veri Seti Analizi":
                 continue
 
             words = topic_model.get_topic(topic_id)
-            topic_words = [w[0] for w in words[:8]]
+            topic_words = [w[0] for w in words[:8]] if words else []
             topic_label_map[topic_id] = auto_label_topic(topic_words)
 
-        df["criterion"] = df["topic"].map(topic_label_map)
-        df = df[df["criterion"].notna()].reset_index(drop=True)
+        df["service_area"] = df["topic"].map(topic_label_map)
+        df = df[df["service_area"].notna()].reset_index(drop=True)
+
+        st.caption(
+            "Not: BERTopic konuları veri tabanlı olarak keşfeder. Prototipte konu adları "
+            "okunabilirlik için anahtar sözcük tabanlı otomatik olarak etiketlenmektedir."
+        )
+        st.dataframe(topic_info, use_container_width=True)
+        st.write("**Konu → Hizmet alanı eşleştirmesi:**", topic_label_map)
+
+        # ---------- ADIM 4: DUYGU ANALİZİ ----------
+        st.subheader("Adım 4 — Duygu Analizi")
 
         with st.spinner("Duygu analizi yapılıyor..."):
-            df["sentiment"] = df["content"].apply(get_sentiment)
+            sentiment_results = df["content"].apply(get_sentiment_scores)
+            df["sentiment"] = sentiment_results.apply(lambda x: x[0])
+            df["negative_score"] = sentiment_results.apply(lambda x: x[1])
+
+        st.caption(
+            "Karar modelinde mutlak duygu şiddeti yerine yalnızca olumsuzluk skoru "
+            "kullanılır; güçlü pozitif yorumlar iyileştirme önceliğini artırmaz."
+        )
+
+        # ---------- ADIM 5: GÖRÜNTÜ İŞLEME ----------
+        st.subheader("Adım 5 — Görüntü İşleme ve Çok Modlu Destek")
 
         if use_images:
-            with st.spinner("Görseller analiz ediliyor..."):
+            with st.spinner("Görsellerde havalimanı temas noktaları sınıflandırılıyor..."):
                 all_labels = []
                 all_confidences = []
-                visual_matches = []
+                multimodal_supports = []
 
                 for _, row in df.iterrows():
-                    files = get_image_files(row["image_files"])
+                    files = get_image_files(row.get("image_files", ""))
                     labels, confidences = analyse_images_for_review(files, image_dict)
 
                     all_labels.append(" | ".join(labels))
-
                     all_confidences.append(
-                        sum(confidences) / len(confidences)
-                        if len(confidences) > 0
-                        else 0
+                        float(np.mean(confidences)) if confidences else 0.0
                     )
-
-                    visual_matches.append(
-                        criterion_visual_match(
-                            row["criterion"],
+                    multimodal_supports.append(
+                        service_area_multimodal_support(
+                            row["service_area"],
                             labels,
                             confidences
                         )
@@ -393,88 +624,128 @@ if sayfa == "1. Veri Seti Analizi":
 
                 df["image_labels"] = all_labels
                 df["image_confidence_avg"] = all_confidences
-                df["visual_match"] = visual_matches
+                df["multimodal_support"] = multimodal_supports
         else:
             df["image_labels"] = ""
-            df["image_confidence_avg"] = 0
-            df["visual_match"] = 0
+            df["image_confidence_avg"] = 0.0
+            df["multimodal_support"] = 0.0
 
-        mcdm_df = build_mcdm(df)
+        st.caption(
+            "Çok modlu destek, görseldeki sorunun şiddetini değil; metinde belirlenen "
+            "hizmet alanının ilişkili görsel temas noktasıyla bağlamsal uyumunu gösterir."
+        )
 
-        st.subheader("Konu Özeti")
-        st.dataframe(topic_info)
-
-        st.subheader("Konu → Kriter Eşleştirme")
-        st.write(topic_label_map)
-
-        st.subheader("Analiz Edilmiş Yorumlar")
         display_cols = [
-            "content", "topic", "criterion", "sentiment",
-            "image_files", "image_labels", "visual_match"
+            "content", "topic", "service_area", "sentiment", "negative_score",
+            "image_files", "image_labels", "image_confidence_avg", "multimodal_support"
         ]
         existing_cols = [col for col in display_cols if col in df.columns]
-        st.dataframe(df[existing_cols])
+        st.dataframe(df[existing_cols], use_container_width=True)
 
-        st.subheader("Karar çıktıları")
-        st.dataframe(mcdm_df)
+        # ---------- ADIM 6: KARAR MATRİSİ + CRITIC ----------
+        st.subheader("Adım 6 — Karar Matrisinin Oluşturulması ve CRITIC Ağırlıklandırma")
 
-        if len(mcdm_df) > 0:
-            top_row = mcdm_df.sort_values("rank").iloc[0]
+        decision_df = build_decision_matrix(df)
+
+        if len(decision_df) < 2:
+            st.error(
+                "MCDM analizi için en az iki farklı hizmet alanı gereklidir. "
+                "Konu modelleme ayarını veya veri setini kontrol edin."
+            )
+            st.stop()
+
+        normalized_df = normalize_decision_matrix(decision_df)
+        critic_weights = calculate_critic_weights(normalized_df)
+
+        st.markdown("**Başlangıç karar matrisi**")
+        st.dataframe(decision_df, use_container_width=True)
+
+        st.markdown("**CRITIC için normalize edilmiş karar matrisi**")
+        st.dataframe(normalized_df, use_container_width=True)
+
+        st.markdown("**CRITIC kriter ağırlıkları**")
+        st.dataframe(critic_weights, use_container_width=True)
+
+        fig_w, ax_w = plt.subplots()
+        chart_w = critic_weights.sort_values("weight", ascending=True)
+        ax_w.barh(chart_w["criterion_name"], chart_w["weight"])
+        ax_w.set_xlabel("CRITIC ağırlığı")
+        ax_w.set_title("Veri Tabanlı Kriter Ağırlıkları")
+        st.pyplot(fig_w)
+        plt.close(fig_w)
+
+        # ---------- ADIM 7: TOPSIS ----------
+        st.subheader("Adım 7 — TOPSIS ile Hizmet İyileştirme Önceliklerinin Belirlenmesi")
+
+        topsis_df = calculate_topsis(decision_df, critic_weights)
+        st.dataframe(topsis_df, use_container_width=True)
+
+        if not topsis_df.empty:
+            top_row = topsis_df.iloc[0]
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Kriter Sayısı", len(mcdm_df))
-            c2.metric("En Öncelikli Alan", top_row["criterion"])
-            c3.metric("Öncelik Skoru", round(top_row["mcdm_score"], 3))
+            c1.metric("Hizmet Alanı Sayısı", len(topsis_df))
+            c2.metric("En Öncelikli Hizmet Alanı", top_row["service_area"])
+            c3.metric("TOPSIS Yakınlık Skoru", round(float(top_row["topsis_score"]), 3))
 
-            st.subheader("Kriter Ağırlıkları")
+            fig_s, ax_s = plt.subplots()
+            score_df = topsis_df.sort_values("topsis_score", ascending=True)
+            ax_s.barh(score_df["service_area"], score_df["topsis_score"])
+            ax_s.set_xlabel("TOPSIS yakınlık skoru")
+            ax_s.set_title("Hizmet İyileştirme Öncelikleri")
+            st.pyplot(fig_s)
+            plt.close(fig_s)
 
-            fig, ax = plt.subplots()
-            chart_df = mcdm_df.sort_values("weight", ascending=True)
-            ax.barh(chart_df["criterion"], chart_df["weight"])
-            ax.set_xlabel("Ağırlık")
-            ax.set_title("Veri Tabanlı Kriter Ağırlıkları")
-            st.pyplot(fig)
-
-            st.subheader("İyileştirme Öncelik Skorları")
-
-            fig2, ax2 = plt.subplots()
-            score_df = mcdm_df.sort_values("mcdm_score", ascending=True)
-            ax2.barh(score_df["criterion"], score_df["mcdm_score"])
-            ax2.set_xlabel("MCDM Skoru")
-            ax2.set_title("Hizmet İyileştirme Öncelikleri")
-            st.pyplot(fig2)
-
-            st.subheader("Yönetimsel Yorum")
-
+            st.markdown("**Yönetimsel yorum**")
             st.write(
-                f"Analiz sonuçlarına göre en öncelikli hizmet alanı "
-                f"**{top_row['criterion']}** olarak belirlenmiştir. "
-                f"Bu alan, havalimanı yöneticileri açısından ilk iyileştirme "
-                f"odaklarından biri olarak değerlendirilebilir."
+                f"CRITIC-TOPSIS sonuçlarına göre **{top_row['service_area']}** "
+                f"hizmet alanı bu veri setinde en yüksek iyileştirme önceliğine sahiptir. "
+                "Sonuç, yaygınlık, olumsuz duygu ve çok modlu destek göstergelerinin "
+                "veri tabanlı ağırlıkları birlikte dikkate alınarak elde edilmiştir."
             )
 
-        st.download_button(
-            "Analiz Edilmiş Veriyi İndir",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="analiz_edilmis_yorumlar.csv",
-            mime="text/csv"
-        )
+        # ---------- İNDİRME ----------
+        st.divider()
+        st.subheader("Çıktıları İndir")
 
-        st.download_button(
-            "MCDM Sonuçlarını İndir",
-            data=mcdm_df.to_csv(index=False).encode("utf-8"),
-            file_name="mcdm_sonuclari.csv",
-            mime="text/csv"
-        )
+        d1, d2, d3 = st.columns(3)
+
+        with d1:
+            st.download_button(
+                "Analiz Edilmiş Yorumlar",
+                data=df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="analiz_edilmis_yorumlar.csv",
+                mime="text/csv"
+            )
+
+        with d2:
+            st.download_button(
+                "CRITIC Ağırlıkları",
+                data=critic_weights.to_csv(index=False).encode("utf-8-sig"),
+                file_name="critic_agirliklari.csv",
+                mime="text/csv"
+            )
+
+        with d3:
+            st.download_button(
+                "TOPSIS Sonuçları",
+                data=topsis_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="topsis_sonuclari.csv",
+                mime="text/csv"
+            )
 
 
 # ==================================================
-# EKRAN 2
+# EKRAN 2: MANUEL YORUM VE GÖRSEL ANALİZİ
 # ==================================================
 
 elif sayfa == "2. Manuel Yorum ve Görsel Analizi":
 
     st.header("2. Manuel Yorum ve Görsel Analizi")
+    st.caption(
+        "Bu ekran tek bir kayıt üzerinde metin duygu analizi, hizmet alanı eşleştirmesi "
+        "ve opsiyonel görsel temas noktası sınıflandırmasını gösterir."
+    )
 
     manual_text = st.text_area(
         "Yolcu yorumunu giriniz",
@@ -487,35 +758,48 @@ elif sayfa == "2. Manuel Yorum ve Görsel Analizi":
         type=["jpg", "jpeg", "png", "webp"]
     )
 
-    if st.button("Manuel Analizi Başlat"):
+    if st.button("Manuel Analizi Başlat", type="primary"):
 
         if not manual_text.strip():
             st.error("Lütfen bir yorum giriniz.")
         else:
-            sentiment = get_sentiment(manual_text)
-            criterion = manual_criterion_mapping(manual_text)
+            signed_sentiment, negative_score = get_sentiment_scores(manual_text)
+            service_area = manual_service_area_mapping(manual_text)
 
             image_label = "Görsel yok"
             image_confidence = 0.0
+            multimodal_support = 0.0
 
             if uploaded_image is not None:
                 image = Image.open(uploaded_image).convert("RGB")
                 st.image(image, caption="Yüklenen Görsel", use_container_width=True)
 
-                with st.spinner("Görsel sınıflandırılıyor..."):
+                with st.spinner("Görsel temas noktası sınıflandırılıyor..."):
                     image_label, image_confidence = classify_image(image)
+
+                multimodal_support = service_area_multimodal_support(
+                    service_area,
+                    [image_label],
+                    [image_confidence]
+                )
 
             st.subheader("Manuel Analiz Sonucu")
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Tespit Edilen Kriter", criterion)
-            c2.metric("Duygu Skoru", round(sentiment, 3))
-            c3.metric("Görsel Etiketi", image_label)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Hizmet Alanı", service_area)
+            c2.metric("İmzalı Duygu", round(signed_sentiment, 3))
+            c3.metric("Olumsuzluk Skoru", round(negative_score, 3))
+            c4.metric("Çok Modlu Destek", round(multimodal_support, 3))
+
+            st.write(f"**Görsel temas noktası:** {image_label}")
+            st.write(f"**Görsel sınıflandırma güveni:** {image_confidence:.3f}")
 
             st.json({
                 "yorum": manual_text,
-                "kriter": criterion,
-                "duygu_skoru": sentiment,
-                "gorsel_etiketi": image_label,
-                "gorsel_guven_skoru": image_confidence
+                "hizmet_alani": service_area,
+                "duygu_skoru": signed_sentiment,
+                "olumsuz_duygu_skoru": negative_score,
+                "gorsel_temas_noktasi": image_label,
+                "gorsel_guven_skoru": image_confidence,
+                "cok_modlu_destek": multimodal_support
             })
