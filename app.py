@@ -28,7 +28,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Havalimanı Yolcu Deneyimi Karar Destek Prototipi")
+st.title("Termin-AI: Havalimanı Yolcu Deneyimine Yönelik Yapay Zeka Destekli Karar Destek Sistemi Prototipi")
 st.caption(
     "UGC → Önişleme → Konu Modelleme → Duygu Analizi → Görüntü İşleme → "
     "Karar Matrisi / CRITIC → TOPSIS"
