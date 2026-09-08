@@ -39,7 +39,7 @@ sayfa = st.sidebar.radio(
     ["1. Veri Seti Analizi", "2. Manuel Yorum ve Görsel Analizi"]
 )
 
-st.sidebar.caption("Hızlandırılmış + tekrarlanabilir sürüm: cache + batch inference + sabit random_state")
+st.sidebar.caption("Hızlandırılmış + tekrarlanabilir sürüm: otomatik konu büyüklüğü + cache + batch inference + sabit random_state")
 
 with st.sidebar.expander("Proje metodolojik akışı", expanded=True):
     st.markdown(
@@ -126,8 +126,12 @@ def preprocess_topic_text(text):
 # ==================================================
 
 @st.cache_resource(show_spinner=False)
-def run_bertopic(docs_tuple, min_topic_size=3):
+def run_bertopic(docs_tuple):
     docs = list(docs_tuple)
+
+    # Veri seti büyüklüğüne göre otomatik minimum küme büyüklüğü:
+    # en az 3 kayıt, daha büyük veri setlerinde yaklaşık %5.
+    min_topic_size = max(3, round(len(docs) * 0.05))
 
     # Olumsuzluk belirteçlerini (not/no vb.) stop-word listesine koymuyoruz.
     stopwords = [
@@ -181,7 +185,7 @@ def run_bertopic(docs_tuple, min_topic_size=3):
     )
 
     topics, _ = topic_model.fit_transform(docs)
-    return topic_model, topics
+    return topic_model, topics, min_topic_size
 
 
 def auto_label_topic(words):
@@ -581,12 +585,9 @@ if sayfa == "1. Veri Seti Analizi":
         value="https://raw.githubusercontent.com/bahribarankocak/airport-dashboard/main/images"
     )
 
-    min_topic_size = st.slider(
-        "Minimum konu büyüklüğü",
-        min_value=2,
-        max_value=10,
-        value=3,
-        help="Pilot veri setinde daha kararlı konu kümeleri için varsayılan değer 3 olarak belirlenmiştir."
+    st.caption(
+        "Konu modellemede minimum küme büyüklüğü kullanıcı tarafından seçilmez; "
+        "yorum sayısına göre otomatik olarak belirlenir."
     )
 
     if st.button("Veriyi GitHub'dan Yükle ve Analizi Başlat", type="primary"):
@@ -644,7 +645,7 @@ if sayfa == "1. Veri Seti Analizi":
         docs = df["topic_text"].tolist()
 
         with st.spinner("Sentence-Transformer + BERTopic çalıştırılıyor..."):
-            topic_model, topics = run_bertopic(tuple(docs), min_topic_size)
+            topic_model, topics, auto_min_topic_size = run_bertopic(tuple(docs))
             df["topic"] = topics
 
         topic_info = topic_model.get_topic_info()
@@ -666,6 +667,21 @@ if sayfa == "1. Veri Seti Analizi":
             "okunabilirlik için anahtar sözcük tabanlı otomatik olarak etiketlenmektedir."
         )
         st.dataframe(topic_info, use_container_width=True)
+
+        discovered_topics = len([t for t in set(topics) if t != -1])
+        outlier_count = sum(1 for t in topics if t == -1)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Analiz edilen yorum", len(df))
+        m2.metric("Otomatik minimum küme büyüklüğü", auto_min_topic_size)
+        m3.metric("Keşfedilen konu sayısı", discovered_topics)
+
+        if outlier_count > 0:
+            st.caption(
+                f"HDBSCAN tarafından konu dışı (outlier) olarak değerlendirilen "
+                f"yorum sayısı: {outlier_count}"
+            )
+
         st.write("**Konu → Hizmet alanı eşleştirmesi:**", topic_label_map)
 
         # ---------- ADIM 4: DUYGU ANALİZİ ----------
