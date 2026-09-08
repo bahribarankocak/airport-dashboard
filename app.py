@@ -131,7 +131,7 @@ def run_bertopic(docs_tuple):
 
     # Veri seti büyüklüğüne göre otomatik minimum küme büyüklüğü:
     # en az 3 kayıt, daha büyük veri setlerinde yaklaşık %5.
-    min_topic_size = max(3, round(len(docs) * 0.05))
+    min_topic_size = max(2, round(len(docs) * 0.05))
 
     # Olumsuzluk belirteçlerini (not/no vb.) stop-word listesine koymuyoruz.
     stopwords = [
