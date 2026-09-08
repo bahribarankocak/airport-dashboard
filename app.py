@@ -28,7 +28,46 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Termin-AI: Havalimanı Yolcu Deneyimine Yönelik Yapay Zeka Destekli Karar Destek Sistemi Prototipi")
+st.markdown("""
+<style>
+    /* Daha kompakt akademik dashboard görünümü */
+    .block-container {
+        padding-top: 1.4rem;
+        padding-bottom: 2rem;
+    }
+    h1 {
+        font-size: 1.75rem !important;
+        line-height: 1.2 !important;
+        margin-bottom: 0.35rem !important;
+    }
+    h2 {
+        font-size: 1.35rem !important;
+        line-height: 1.25 !important;
+        margin-top: 1rem !important;
+        margin-bottom: 0.45rem !important;
+    }
+    h3 {
+        font-size: 1.08rem !important;
+        line-height: 1.25 !important;
+        margin-top: 0.8rem !important;
+        margin-bottom: 0.35rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.35rem !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.88rem !important;
+    }
+    .stCaption, small {
+        font-size: 0.82rem !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    "<h1>Havalimanı Yolcu Deneyimi Karar Destek Prototipi</h1>",
+    unsafe_allow_html=True
+)
 st.caption(
     "UGC → Önişleme → Konu Modelleme → Duygu Analizi → Görüntü İşleme → "
     "Karar Matrisi / CRITIC → TOPSIS"
@@ -40,6 +79,48 @@ sayfa = st.sidebar.radio(
 )
 
 st.sidebar.caption("Hızlandırılmış + tekrarlanabilir sürüm: otomatik konu büyüklüğü + cache + batch inference + sabit random_state")
+
+# ==================================================
+# ARAYÜZ İÇİN TÜRKÇE SÜTUN ADLARI
+# ==================================================
+
+TURKISH_COLUMN_NAMES = {
+    "content": "Yolcu Yorumu",
+    "topic_text": "Önişlenmiş Metin",
+    "topic": "Konu No",
+    "service_area": "Hizmet Alanı",
+    "sentiment": "Duygu Skoru",
+    "negative_score": "Olumsuz Duygu",
+    "image_files": "Görsel Dosyaları",
+    "image_labels": "Görsel Temas Noktası",
+    "image_confidence_avg": "Görsel Güven Düzeyi",
+    "multimodal_support": "Çok Modlu Destek",
+    "mention_count": "Yorum Sayısı",
+    "prevalence": "C1 - Yaygınlık",
+    "negative_sentiment": "C2 - Olumsuz Duygu",
+    "C1_prevalence": "C1 - Yaygınlık",
+    "C2_negative_sentiment": "C2 - Olumsuz Duygu",
+    "C3_multimodal_support": "C3 - Çok Modlu Destek",
+    "criterion": "Kriter Kodu",
+    "criterion_name": "Kriter",
+    "critic_information": "CRITIC Bilgi Miktarı",
+    "weight": "Ağırlık",
+    "topsis_score": "TOPSIS Skoru",
+    "rank": "Sıra",
+    "Topic": "Konu No",
+    "Count": "Yorum Sayısı",
+    "Name": "Konu Anahtar Sözcükleri",
+    "Representation": "Konu Temsili",
+    "Representative_Docs": "Temsilî Yorumlar"
+}
+
+def tr_columns(dataframe):
+    """İç hesaplamaları değiştirmeden yalnızca ekranda sütun adlarını Türkçeleştirir."""
+    return dataframe.rename(columns={
+        col: TURKISH_COLUMN_NAMES.get(col, col)
+        for col in dataframe.columns
+    })
+
 
 with st.sidebar.expander("Proje metodolojik akışı", expanded=True):
     st.markdown(
@@ -129,9 +210,9 @@ def preprocess_topic_text(text):
 def run_bertopic(docs_tuple):
     docs = list(docs_tuple)
 
-    # Veri seti büyüklüğüne göre otomatik minimum küme büyüklüğü:
+    # Temel otomatik minimum küme büyüklüğü:
     # en az 3 kayıt, daha büyük veri setlerinde yaklaşık %5.
-    min_topic_size = max(2, round(len(docs) * 0.05))
+    base_min_topic_size = max(3, round(len(docs) * 0.05))
 
     # Olumsuzluk belirteçlerini (not/no vb.) stop-word listesine koymuyoruz.
     stopwords = [
@@ -154,38 +235,77 @@ def run_bertopic(docs_tuple):
 
     embedding_model = load_embedding_model()
 
-    # Tekrarlanabilirlik için UMAP rastgelelik tohumu sabitlenmiştir.
-    # Böylece aynı veri ve aynı parametrelerle yeniden çalıştırıldığında
-    # konu kümelerinin değişmesi büyük ölçüde önlenir.
-    n_neighbors = max(2, min(5, len(docs) - 1))
+    # Aynı veri + aynı ayarlar için tekrarlanabilirlik.
+    candidate_settings = [
+        # Önce daha korumacı otomatik çözüm
+        {
+            "min_cluster_size": base_min_topic_size,
+            "n_neighbors": max(2, min(5, len(docs) - 1)),
+            "cluster_selection_method": "eom"
+        },
+        # 3'ten az konu bulunursa daha ayrıntılı deterministik çözüm
+        {
+            "min_cluster_size": max(2, base_min_topic_size - 1),
+            "n_neighbors": max(2, min(4, len(docs) - 1)),
+            "cluster_selection_method": "leaf"
+        },
+        {
+            "min_cluster_size": 2,
+            "n_neighbors": max(2, min(3, len(docs) - 1)),
+            "cluster_selection_method": "leaf"
+        }
+    ]
 
-    umap_model = UMAP(
-        n_neighbors=n_neighbors,
-        n_components=5,
-        min_dist=0.0,
-        metric="cosine",
-        random_state=42
-    )
+    best_result = None
+    best_topic_count = -1
 
-    hdbscan_model = HDBSCAN(
-        min_cluster_size=min_topic_size,
-        metric="euclidean",
-        cluster_selection_method="eom",
-        prediction_data=True
-    )
+    for settings in candidate_settings:
+        umap_model = UMAP(
+            n_neighbors=settings["n_neighbors"],
+            n_components=5,
+            min_dist=0.0,
+            metric="cosine",
+            random_state=42
+        )
 
-    topic_model = BERTopic(
-        embedding_model=embedding_model,
-        vectorizer_model=vectorizer_model,
-        umap_model=umap_model,
-        hdbscan_model=hdbscan_model,
-        language="english",
-        calculate_probabilities=False,
-        verbose=False
-    )
+        hdbscan_model = HDBSCAN(
+            min_cluster_size=settings["min_cluster_size"],
+            metric="euclidean",
+            cluster_selection_method=settings["cluster_selection_method"],
+            prediction_data=True
+        )
 
-    topics, _ = topic_model.fit_transform(docs)
-    return topic_model, topics, min_topic_size
+        topic_model = BERTopic(
+            embedding_model=embedding_model,
+            vectorizer_model=vectorizer_model,
+            umap_model=umap_model,
+            hdbscan_model=hdbscan_model,
+            language="english",
+            calculate_probabilities=False,
+            verbose=False
+        )
+
+        topics, _ = topic_model.fit_transform(docs)
+        topic_count = len({t for t in topics if t != -1})
+
+        candidate_result = (
+            topic_model,
+            topics,
+            settings["min_cluster_size"],
+            settings["cluster_selection_method"],
+            settings["n_neighbors"]
+        )
+
+        if topic_count > best_topic_count:
+            best_result = candidate_result
+            best_topic_count = topic_count
+
+        # Minimum 3 anlamlı konu bulunduğunda ek denemeye gerek yok.
+        if topic_count >= 3:
+            return candidate_result
+
+    # Veri 3 konu üretmiyorsa yapay konu oluşturmak yerine en ayrıntılı gerçek çözümü döndür.
+    return best_result
 
 
 def auto_label_topic(words):
@@ -566,7 +686,7 @@ def calculate_topsis(decision_df, weights_df):
 
 if sayfa == "1. Veri Seti Analizi":
 
-    st.header("1. Veri Seti Analizi")
+    st.header("Veri Seti Analizi")
 
     st.info(
         "Bu ekran proje metodolojisinin ön prototipidir. Görüntü sınıflandırmasında "
@@ -593,7 +713,7 @@ if sayfa == "1. Veri Seti Analizi":
     if st.button("Veriyi GitHub'dan Yükle ve Analizi Başlat", type="primary"):
 
         # ---------- ADIM 1: VERİ ----------
-        st.subheader("Adım 1 — Veri")
+        st.subheader("1. Veri")
 
         try:
             df = load_excel_data(excel_url).copy()
@@ -607,7 +727,7 @@ if sayfa == "1. Veri Seti Analizi":
             st.stop()
 
         # ---------- ADIM 2: ÖNİŞLEME ----------
-        st.subheader("Adım 2 — Önişleme")
+        st.subheader("2. Önişleme")
 
         df = df[df["content"].notna()].copy()
         df["content"] = df["content"].astype(str).str.strip()
@@ -622,7 +742,7 @@ if sayfa == "1. Veri Seti Analizi":
             st.stop()
 
         st.write(f"Önişleme sonrası analiz edilebilir yorum sayısı: **{len(df)}**")
-        st.dataframe(df[["content", "topic_text"]].head(10), use_container_width=True)
+        st.dataframe(tr_columns(df[["content", "topic_text"]].head(10)), use_container_width=True)
 
         with st.spinner("GitHub görselleri kontrol ediliyor..."):
             image_dict = build_image_dict_from_github(df, image_base_url)
@@ -640,12 +760,18 @@ if sayfa == "1. Veri Seti Analizi":
                 df["image_files"] = ""
 
         # ---------- ADIM 3: KONU MODELLEME ----------
-        st.subheader("Adım 3 — Konu Modelleme")
+        st.subheader("3. Konu Modelleme")
 
         docs = df["topic_text"].tolist()
 
         with st.spinner("Sentence-Transformer + BERTopic çalıştırılıyor..."):
-            topic_model, topics, auto_min_topic_size = run_bertopic(tuple(docs))
+            (
+                topic_model,
+                topics,
+                auto_min_topic_size,
+                clustering_method,
+                auto_n_neighbors
+            ) = run_bertopic(tuple(docs))
             df["topic"] = topics
 
         topic_info = topic_model.get_topic_info()
@@ -666,15 +792,26 @@ if sayfa == "1. Veri Seti Analizi":
             "Not: BERTopic konuları veri tabanlı olarak keşfeder. Prototipte konu adları "
             "okunabilirlik için anahtar sözcük tabanlı otomatik olarak etiketlenmektedir."
         )
-        st.dataframe(topic_info, use_container_width=True)
+        st.dataframe(tr_columns(topic_info), use_container_width=True)
 
         discovered_topics = len([t for t in set(topics) if t != -1])
         outlier_count = sum(1 for t in topics if t == -1)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Analiz edilen yorum", len(df))
-        m2.metric("Otomatik minimum küme büyüklüğü", auto_min_topic_size)
-        m3.metric("Keşfedilen konu sayısı", discovered_topics)
+        m1.metric("Analiz Edilen Yorum", len(df))
+        m2.metric("Minimum Küme Büyüklüğü", auto_min_topic_size)
+        m3.metric("Keşfedilen Konu", discovered_topics)
+
+        st.caption(
+            f"Otomatik kümeleme: {clustering_method.upper()} | "
+            f"UMAP komşuluk sayısı: {auto_n_neighbors} | random_state: 42"
+        )
+
+        if discovered_topics < 3:
+            st.warning(
+                "Model, daha ayrıntılı otomatik denemelere rağmen 3'ten az anlamlı konu "
+                "keşfetti. Yapay konu üretilmedi; veri tarafından desteklenen çözüm gösteriliyor."
+            )
 
         if outlier_count > 0:
             st.caption(
@@ -682,10 +819,15 @@ if sayfa == "1. Veri Seti Analizi":
                 f"yorum sayısı: {outlier_count}"
             )
 
-        st.write("**Konu → Hizmet alanı eşleştirmesi:**", topic_label_map)
+        st.markdown("**Konu – hizmet alanı eşleştirmesi**")
+        mapping_df = pd.DataFrame(
+            sorted(topic_label_map.items()),
+            columns=["Konu No", "Hizmet Alanı"]
+        )
+        st.dataframe(mapping_df, use_container_width=True, hide_index=True)
 
         # ---------- ADIM 4: DUYGU ANALİZİ ----------
-        st.subheader("Adım 4 — Duygu Analizi")
+        st.subheader("4. Duygu Analizi")
 
         with st.spinner("Duygu analizi yapılıyor..."):
             signed_scores, negative_scores = batch_sentiment_scores(
@@ -701,7 +843,7 @@ if sayfa == "1. Veri Seti Analizi":
         )
 
         # ---------- ADIM 5: GÖRÜNTÜ İŞLEME ----------
-        st.subheader("Adım 5 — Görüntü İşleme ve Çok Modlu Destek")
+        st.subheader("5. Görüntü İşleme ve Çok Modlu Destek")
 
         if use_images:
             with st.spinner("Görseller batch olarak sınıflandırılıyor..."):
@@ -748,10 +890,10 @@ if sayfa == "1. Veri Seti Analizi":
             "image_files", "image_labels", "image_confidence_avg", "multimodal_support"
         ]
         existing_cols = [col for col in display_cols if col in df.columns]
-        st.dataframe(df[existing_cols], use_container_width=True)
+        st.dataframe(tr_columns(df[existing_cols]), use_container_width=True)
 
         # ---------- ADIM 6: KARAR MATRİSİ + CRITIC ----------
-        st.subheader("Adım 6 — Karar Matrisinin Oluşturulması ve CRITIC Ağırlıklandırma")
+        st.subheader("6. Karar Matrisi ve CRITIC Ağırlıklandırma")
 
         decision_df = build_decision_matrix(df)
 
@@ -766,13 +908,13 @@ if sayfa == "1. Veri Seti Analizi":
         critic_weights = calculate_critic_weights(normalized_df)
 
         st.markdown("**Başlangıç karar matrisi**")
-        st.dataframe(decision_df, use_container_width=True)
+        st.dataframe(tr_columns(decision_df), use_container_width=True)
 
         st.markdown("**CRITIC için normalize edilmiş karar matrisi**")
-        st.dataframe(normalized_df, use_container_width=True)
+        st.dataframe(tr_columns(normalized_df), use_container_width=True)
 
         st.markdown("**CRITIC kriter ağırlıkları**")
-        st.dataframe(critic_weights, use_container_width=True)
+        st.dataframe(tr_columns(critic_weights), use_container_width=True)
 
         fig_w, ax_w = plt.subplots()
         chart_w = critic_weights.sort_values("weight", ascending=True)
@@ -783,10 +925,10 @@ if sayfa == "1. Veri Seti Analizi":
         plt.close(fig_w)
 
         # ---------- ADIM 7: TOPSIS ----------
-        st.subheader("Adım 7 — TOPSIS ile Hizmet İyileştirme Önceliklerinin Belirlenmesi")
+        st.subheader("7. TOPSIS ile İyileştirme Öncelikleri")
 
         topsis_df = calculate_topsis(decision_df, critic_weights)
-        st.dataframe(topsis_df, use_container_width=True)
+        st.dataframe(tr_columns(topsis_df), use_container_width=True)
 
         if not topsis_df.empty:
             top_row = topsis_df.iloc[0]
@@ -849,7 +991,7 @@ if sayfa == "1. Veri Seti Analizi":
 
 elif sayfa == "2. Manuel Yorum ve Görsel Analizi":
 
-    st.header("2. Manuel Yorum ve Görsel Analizi")
+    st.header("Manuel Yorum ve Görsel Analizi")
     st.caption(
         "Bu ekran tek bir kayıt üzerinde metin duygu analizi, hizmet alanı eşleştirmesi "
         "ve opsiyonel görsel temas noktası sınıflandırmasını gösterir."
@@ -891,7 +1033,7 @@ elif sayfa == "2. Manuel Yorum ve Görsel Analizi":
                     [image_confidence]
                 )
 
-            st.subheader("Manuel Analiz Sonucu")
+            st.subheader("Analiz Sonucu")
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Hizmet Alanı", service_area)
